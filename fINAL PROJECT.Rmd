@@ -1,0 +1,399 @@
+---
+title: "ADA Final Project"
+author: "Kaleb Urga"
+date: "2025-02-12"
+output: html_document
+---
+1. R Packages Used and Their Functions
+```{r, echo=TRUE, message = F}
+pacman::p_load(
+  odds.n.ends,        # Sensitivity/specificity, ROC curves, predictive probability plots
+  DiagrammeR,         # Flowcharts and diagrams
+  DiagrammeRsvg,      # Export DiagrammeR graphics to SVG
+  blorr,              # Logistic regression diagnostics and performance tools
+  glue,               # String interpolation (used for flowchart labels)
+  haven,              # Import NHANES XPT files
+  survey,             # Survey design and survey-weighted models
+  ggplot2,            # Data visualization
+  lmtest,             # Likelihood ratio tests and model comparison
+  car,                # Regression diagnostics, including VIF
+  rsvg,               # Convert SVG diagrams to PNG
+  broom,              # Tidy model outputs
+  dplyr,              # Data manipulation
+  tidyverse,          # Core data science packages (dplyr, ggplot2, readr, etc.)
+  readr,              # Read data efficiently
+  jtools,             # Additional regression tools (incl. VIF)
+  table1,             # Publication-ready descriptive tables
+  rvg,                # Vector graphics for MS Office outputs
+  officer,            # Create/edit Word and PowerPoint files
+  htmlwidgets,        # Export tables/plots to HTML
+  webshot2,           # Capture HTML and save as PNG
+  htmltools)
+```
+Next Steps:
+With all required packages loaded, we can now proceed to importing the NHANES datasets and beginning data cleaning and preparation for analysis.
+
+
+2. Load NHANES datasets
+```{r}
+# Import NHANES datasets: demographics, diabetes, insurance, BMI, HbA1c
+# DEMO_L: demographics + weights
+demo <- read_xpt("DEMO_L.XPT") %>%
+  select(SEQN, WTMEC2YR, SDMVSTRA, SDMVPSU, RIDAGEYR, RIAGENDR, DMDEDUC2, RIDEXPRG, RIDRETH3)
+# DIQ_L: diabetes status
+diq <- read_xpt("DIQ_L.XPT") %>% select(SEQN, DIQ010)
+# HIQ_L: insurance
+hiq <- read_xpt("HIQ_L.XPT") %>% select(SEQN, HIQ011, HIQ032A, HIQ032B, HIQ032C, HIQ032D, HIQ032E, HIQ032F, HIQ032H,HIQ032I)
+# BMX_L: BMI
+bmx <- read_xpt("BMX_L.XPT") %>% select(SEQN, BMXBMI)
+# GHB_L: HbA1c
+ghb <- read_xpt("GHB_L.XPT") %>% select(SEQN, LBXGH)
+
+
+# Merge datasets by participant ID
+nhanes <- demo %>%
+  left_join(diq, by = "SEQN") %>%
+  left_join(hiq, by = "SEQN") %>%
+  left_join(bmx, by = "SEQN") %>%
+  left_join(ghb, by = "SEQN")
+```
+
+
+3. Rename variables for readability
+```{r}
+nhanes_renamed <- nhanes %>%
+  rename(
+    id = SEQN,
+    weight = WTMEC2YR,
+    strata = SDMVSTRA,
+    psu = SDMVPSU,
+    age = RIDAGEYR,
+    sex = RIAGENDR,
+    race = RIDRETH3,
+    bmi = BMXBMI,
+    education = DMDEDUC2,
+    pregnancy = RIDEXPRG,
+    diabetes = DIQ010,
+    insurance_any = HIQ011,
+    insurance_private = HIQ032A,
+    insurance_medicare = HIQ032B,
+    insurance_medigap = HIQ032C,
+    insurance_medicaid = HIQ032D,
+    insurance_chip = HIQ032E,
+    insurance_military = HIQ032F,
+    insurance_state = HIQ032H,
+    insurance_other = HIQ032I,
+    hba1c = LBXGH)
+```
+
+
+4. Apply exclusions
+Sequentially exclude participants to create the final analytic dataset, ensuring complete data for outcome and covariates.
+```{r}
+# Exclusion 1: Keep only participants with diagnosed diabetes
+nhanes_cleaned1 <- nhanes_renamed %>% filter(diabetes == 1)
+
+# Exclusion 2: Remove pregnant participants
+nhanes_cleaned2 <- nhanes_cleaned1 %>% filter(pregnancy != 1 | is.na(pregnancy))
+
+# Exclusion 3: Remove participants with missing HbA1c
+nhanes_cleaned3 <- nhanes_cleaned2 %>% drop_na(hba1c)
+
+# Exclusion 4: Remove participants with missing covariates or education = 9
+nhanes_analysis <- nhanes_cleaned3 %>% filter(education != 9) %>% drop_na(insurance_any, bmi, education)
+```
+
+
+5. Create and export flowchart as an image file
+```{r}
+# Calculate remaining counts after each exclusion
+n_start <- nrow(nhanes_renamed)
+n_after_ex1 <- nrow(nhanes_cleaned1)
+n_after_ex2 <- nrow(nhanes_cleaned2)
+n_after_ex3 <- nrow(nhanes_cleaned3)
+n_after_ex4 <- nrow(nhanes_analysis)
+
+# Visualize exclusions in a flowchart
+fig1 <- grViz(diagram = glue("digraph flowchart {{node [fontname = Helvetica, shape = rectangle, fontsize = 15]
+                  node1 [label = '@@1']
+                  node2 [label = '@@2']
+                  node3 [label = '@@3']
+                  node4 [label = '@@4']
+                  node5 [label = '@@5']
+          node1 -> node2 -> node3 -> node4 -> node5}}
+          
+[1]: 'Records received from NHANES n = {n_start}'
+[2]: 'Exclusion 1: Keep only diabetes diagnosed individuals n = {n_after_ex1}'
+[3]: 'Exclusion 2: Exclude pregnant participants n = {n_after_ex2}'
+[4]: 'Exclusion 3: Exclude missing HbA1c (outcome) n = {n_after_ex3}'
+[5]: 'Exclusion 4: Exclude missing data on independent variables/covariates n = {n_after_ex4}'"))
+
+# Convert to SVG first
+fig1_svg <- DiagrammeRsvg::export_svg(fig1)
+
+# Save as PNG
+rsvg::rsvg_png(charToRaw(fig1_svg), "figure1_flowchart.png", width = 800, height = 600)
+```
+
+
+6. define outcome: poor glycemic control
+```{r}
+nhanes_analysis <- nhanes_analysis %>%
+  mutate(poor_control = factor(if_else(hba1c >= 7, 1, 0),
+        levels = c(0, 1), labels = c("No", "Yes")))
+# Poor control descriptive
+table(nhanes_analysis$poor_control)
+```
+
+
+7.Recode Sex Variable and Create Age Group Category
+```{r}
+nhanes_analysis <- nhanes_analysis %>%
+  mutate(
+    sex = recode_factor(sex, `1` = "Male", `2` = "Female"),
+    age_group = if_else(age < 60, "<60", "60plus"))
+
+```
+
+
+8. Define insurance categories
+```{r}
+nhanes_analysis <- nhanes_analysis %>%
+  mutate(insurance_final = case_when(is.na(insurance_any) ~ "Missing",              
+      insurance_any == 2 ~ "Uninsured",              
+      insurance_private == 1 ~ "Private",            
+      insurance_medicare == 2  | insurance_medigap  == 3  |insurance_medicaid == 4  |
+      insurance_chip     == 5  | insurance_military == 6  |insurance_state    == 8  |
+      insurance_other    == 9  ~ "Other/Public",    
+
+      TRUE ~ "Other/Public"),               
+
+    insurance_final = factor(insurance_final, levels = c("Uninsured", "Private", "Other/Public", "Missing")))
+#Visualize insurance status distribution by outcome variable
+table(nhanes_analysis$insurance_final, nhanes_analysis$poor_control)
+```
+
+
+9. Categorize race and education
+```{r}
+nhanes_analysis <- nhanes_analysis %>%
+  mutate(
+    # Create race categories
+    race_cat = case_when(race == 3 ~ "NH White",        # Non-Hispanic White
+                         race == 4 ~ "NH Black",        # Non-Hispanic Black
+                         race %in% c(1,2,6,7) ~ "Other",  # Hispanic, NH Asian, Other
+                        TRUE ~ NA_character_),
+    race_cat = factor(race_cat, levels = c("NH White", "NH Black", "Other")),
+    
+    # Create education categories
+    education_cat = case_when(education %in% c(1,2) ~ "<High school", education %in% c(3,4,5) ~ "High school+",TRUE ~ NA_character_),
+    education_cat = factor(education_cat, levels = c("<High school", "High school+")))
+
+# Visualize race distribution by outcome variable
+table(nhanes_analysis$race_cat, nhanes_analysis$poor_control, useNA = "always")
+
+# Visualize education level distribution by outcome variable
+table(nhanes_analysis$education_cat, nhanes_analysis$poor_control, useNA = "always")
+```
+
+
+10. Create Table 1
+```{r}
+# --- Step 1: Add labels ---
+label(nhanes_analysis$age) <- "Age (years)"
+label(nhanes_analysis$sex) <- "Sex"
+label(nhanes_analysis$race_cat) <- "Race/Ethnicity"
+label(nhanes_analysis$education_cat) <- "Education Level"
+label(nhanes_analysis$bmi) <- "BMI (kg/m²)"
+label(nhanes_analysis$poor_control) <- "Poor Glycemic Control"
+label(nhanes_analysis$insurance_final) <- "Insurance Status"
+
+# --- Step 2: Create Table 1 stratified by insurance_final ---
+tb1<-table1(~ age + sex + race_cat + education_cat + bmi + poor_control | insurance_final,
+       data = nhanes_analysis,
+       overall = "Total",
+       rowlabelhead = "Variable",
+       footnote = "Continuous variables (Age and BMI) are shown as mean ± SD; BMI = Body Mass Index")
+
+# Export as HTML
+save_html(tb1, file = "table1_nhanes.html")
+```
+
+
+11. Proportion plot of Poor Glycemic Control by Insurance Type
+```{r}
+ggplot(nhanes_analysis, aes(x = insurance_final, fill = factor(poor_control))) +
+  geom_bar(position = "fill") +
+  labs(x = "Insurance Status", y = "Proportion", fill = "Poor Control") +
+  theme_bw()
+```
+    
+    
+12. Survey design
+```{r}
+des <- svydesign(
+  id = ~psu,
+  strata = ~strata,
+  weights = ~weight,
+  data = nhanes_analysis,
+  nest = TRUE)
+```
+
+
+13. Unadjusted Survey-Weighted Logistic Regression logistic regression model assessing the association between insurance status and poor glycemic control.
+```{r}
+model_unadj <- svyglm(poor_control ~ insurance_final, design = des, family = "quasibinomial")
+
+#Model summary
+summary(model_unadj)
+
+#Odds-Ratio and 95% CI
+tidy(model_unadj, exponentiate = TRUE, conf.int = TRUE)
+```
+
+
+14. Testing Non-Linearity of Continuous Covariates (Age and BMI) in Relation to Poor Glycemic Control
+```{r}
+# Age term
+nhanes_analysis <- nhanes_analysis %>%
+  mutate(age.times.logage = age * log(age))
+
+model_age_bt <- glm(poor_control ~ age + age.times.logage,
+                    data = nhanes_analysis, family = "binomial")
+summary(model_age_bt)
+
+# BMI term
+nhanes_analysis <- nhanes_analysis %>%
+  mutate(bmi.times.logbmi = bmi * log(bmi))
+
+model_bmi_bt <- glm(poor_control ~ bmi + bmi.times.logbmi,
+                    data = nhanes_analysis, family = "binomial")
+summary(model_bmi_bt)
+```
+# There is no evidence of non-linearity for age and bmi, the linearity assumption is reasonable. we will use both variables in their continous form for the adjusted model
+
+
+15. Adjusted Survey-Weighted Logistic Regression logistic regression model (age, bmi, race and education)
+```{r}
+model_adj <- svyglm(
+  poor_control ~ insurance_final + age + sex + bmi + race_cat + education_cat,
+  design = des,
+  family = "quasibinomial")
+
+#Model summary
+summary(model_adj)
+
+#Odds-Ratio and 95% CI
+tidy(model_adj, exponentiate = TRUE, conf.int = TRUE)
+```
+
+
+16. Survey-Weighted Logistic Regression with Interaction Between Insurance Status and Age Group
+```{r}
+model_interaction <- svyglm(
+  poor_control ~ insurance_final * age_group + sex + bmi + race_cat  + education_cat,
+  design = des,
+  family = "quasibinomial")
+
+#Model summary
+summary(model_interaction)
+
+#Odds-Ratio and 95% CI
+tidy(model_interaction, exponentiate = TRUE, conf.int = TRUE)
+```
+
+
+17. Unadjusted Survey-Weighted Logistic Regression logistic regression model stratiffied by age
+```{r}
+# Stratified unadjusted models
+model_age_lt60 <- svyglm(poor_control ~ insurance_final,
+                         design = subset(des, age_group == "<60"),
+                         family = "quasibinomial")
+#Model summary
+summary(model_age_lt60)
+
+#Odds-Ratio and 95% CI
+tidy(model_age_lt60, exponentiate = TRUE, conf.int = TRUE)
+
+model_age_ge60 <- svyglm(poor_control ~ insurance_final,
+                         design = subset(des, age_group == "60plus"),
+                         family = "quasibinomial")
+#Model summary
+summary(model_age_ge60)
+
+#Odds-Ratio and 95% CI
+tidy(model_age_ge60 , exponentiate = TRUE, conf.int = TRUE)
+```
+
+
+18. Adjusted Survey-Weighted Logistic Regression logistic regression model stratiffied by age
+```{r}
+# Stratified adjusted models
+model_lt60_adj <- svyglm(poor_control ~ insurance_final + sex + bmi + race_cat + education_cat,
+                         design = subset(des, age_group == "<60"),
+                         family = "quasibinomial")
+#Model summary
+summary(model_lt60_adj)
+
+#Odds-Ratio and 95% CI
+tidy(model_lt60_adj, exponentiate = TRUE, conf.int = TRUE)
+
+model_ge60_adj <- svyglm(poor_control ~ insurance_final + sex + bmi + race_cat + education_cat,
+                         design = subset(des, age_group == "60plus"),
+                         family = "quasibinomial")
+#Model summary
+summary(model_ge60_adj)
+
+#Odds-Ratio and 95% CI
+tidy(model_ge60_adj , exponentiate = TRUE, conf.int = TRUE)
+```
+
+
+19. Check Multicolinearity
+```{r}
+vif(model_adj)
+# another way from the jtools package
+summ(model_adj, vifs = TRUE)
+# cutoff references: https://quantifyinghealth.com/vif-threshold/
+# df is the degrees of freedom associated with the term
+```
+
+
+20. Check for influential cases
+```{r}
+# Plot Cook's distance (approximate for svyglm)
+plot(model_adj, which = 4, id.n = 3, col="red")  # may give a warning, but works for diagnostics
+
+```
+```{r}
+# Add model diagnostics
+model_data <- augment(model_adj, type.predict = "response") %>% 
+  mutate(index = 1:n())  # add row index for plotting
+
+head(model_data)
+```
+```{r}
+# Identify and exclude observations with Cook's Distance > 1
+cutoff <- 1  # common threshold
+
+nhanes_in <- model_data %>% 
+  filter(.cooksd < cutoff)
+
+# Check proportion kept
+nrow(nhanes_in) / nrow(model_data)
+```
+
+
+21. Sensitivity analysis
+```{r}
+# Redefine poor glycemic control as HbA1c >= 7.5%
+nhanes_analysis <- nhanes_analysis %>%
+  mutate(poor_control = if_else(hba1c >= 7.5, 1, 0))
+
+table(nhanes_analysis$poor_control)
+```
+# After redefining the outcome variable, re-run the survey design chunk (lines 222–229), followed by re-running each regression model to obtain updated results.
+
+
+
+
